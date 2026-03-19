@@ -36,8 +36,9 @@ const (
 	CJoinRequest         MessageType = "JoinRequest"  // Node -> Supervisor: 提交 POW 答案
 	CJoinResponse        MessageType = "JoinResponse" // Supervisor -> Node: 准入结果
 	CTakeoverSupervision MessageType = "TakeoverSupervision"
-	CVoteBSG             MessageType = "VoteBSG" // BSG Member -> BSG Leader
-	CTBSign              MessageType = "TBSign"  // Node -> Leader
+	CVoteBSG             MessageType = "VoteBSG"      // BSG Member -> BSG Leader
+	CTBSign              MessageType = "TBSign"       // Node -> Leader
+	CTakeoverEvent       MessageType = "TakeoverEvent" // Takeover event tracking
 )
 
 var (
@@ -229,4 +230,20 @@ type TBSignMsg struct {
 	Signature []byte
 	// VRF 证明 (用于 Leader 验证该节点是否有资格签名)
 	VRFProof []byte
+}
+
+// TakeoverEventMsg records takeover events for measurement
+type TakeoverEventMsg struct {
+	Epoch              int       // Epoch when takeover occurred
+	TakeoverType       string    // "Single" or "BSG"
+	TakeoverShardID    uint64    // Shard ID that takes over (or first BSG member)
+	BSGShardIDs        []uint64  // BSG member shard IDs (empty for single takeover)
+	TargetShardID      uint64    // Target (faulty) shard ID
+	StartTime          time.Time // When takeover was initiated
+	EndTime            time.Time // When takeover completed/ended
+	DurationMs         int64     // Duration in milliseconds
+	LoadFactor         float64   // L_new value at takeover decision
+	ReporterPoolSize   int       // Reporter's current pool size
+	TargetPoolSize     int       // Target's pool size at failure
+	TotalRedirectedTxs int       // Total transactions redirected (optional)
 }

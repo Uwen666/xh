@@ -46,6 +46,7 @@ type Supervisor struct {
 	CurEpochSeed    int64
 	CurrentMainMap  map[uint64]uint64
 	CurrentBSGMap   map[uint64][]uint64
+	CurrentEpoch    int // Track current epoch for takeover events
 }
 
 type SupervisionTopology struct {
@@ -96,6 +97,8 @@ func (d *Supervisor) NewSupervisor(ip string, pcc *params.ChainConfig, committee
 			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestTxNumCount_Broker())
 		case "Tx_Details":
 			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestTxDetail())
+		case "TakeoverDuration":
+			d.testMeasureMods = append(d.testMeasureMods, measure.NewTestModule_TakeoverDuration())
 		default:
 		}
 	}
@@ -114,6 +117,11 @@ func (d *Supervisor) handleBlockInfos(content []byte) {
 		d.Ss.StopGap_Inc()
 	} else {
 		d.Ss.StopGap_Reset()
+	}
+
+	// Update current epoch
+	if bim.Epoch > d.CurrentEpoch {
+		d.CurrentEpoch = bim.Epoch
 	}
 
 	d.comMod.HandleBlockInfo(bim)
@@ -325,6 +333,9 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 		d.sl.Slog.Printf("  >> Pool Sum: %.0f (CS_l: %d, CS_m: %d)\n", poolSum, msg.CurrentPoolSize, msg.TargetPoolSize)
 		d.sl.Slog.Printf("  >> L_new: %.4f (Threshold: %.2f)\n", lNew, params.TakeoverThreshold)
 
+		// Record takeover start time
+		takeoverStartTime := time.Now()
+
 		if lNew <= params.TakeoverThreshold {
 			// 允许 CS_l 接管
 			d.sl.Slog.Println("L1: Decision -> CS_l Takeover Granted.")
@@ -332,26 +343,15 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 			takeoverMsg := message.MergeMessage(message.CTakeover, []byte("Granted"))
 			// 发送给报告者 (CS_l)
 			networks.TcpDial(takeoverMsg, msg.ReporterNode.IPaddr)
-		} else {
-			// 负载过高，转交 BSG (Back-up Supervisor Group)
-			d.sl.Slog.Println("L1: Decision -> CS_l Overloaded. Assigning to BSG.")
-			bsgShardID := (msg.ReporterShardID + 1) % d.ChainConfig.ShardNums
-			if bsgShardID == msg.ReporterShardID {
-				bsgShardID = (bsgShardID%msg.ReporterShardID + 1) % d.ChainConfig.ShardNums
-			}
-			takeoverMsg := message.MergeMessage(message.CTakeover, []byte("BSG_Activated"))
-			for _, ip := range d.Ip_nodeTable[bsgShardID] {
-				networks.TcpDial(takeoverMsg, ip)
-			}
-		}
-		if lNew <= params.TakeoverThreshold {
-			d.sl.Slog.Println("L1: Decision -> CS_l Takeover Granted.")
-			takeoverMsg := message.MergeMessage(message.CTakeover, []byte("Granted"))
-			networks.TcpDial(takeoverMsg, msg.ReporterNode.IPaddr)
 			d.sl.Slog.Printf("L1: Redirecting traffic from Shard %d to Shard %d\n", msg.TargetShardID, msg.ReporterShardID)
 			reporterIPs := d.Ip_nodeTable[msg.ReporterShardID]
 			d.Ip_nodeTable[msg.TargetShardID] = reporterIPs
+
+			// Record single takeover event
+			d.recordTakeoverEvent("Single", msg.ReporterShardID, []uint64{}, msg.TargetShardID,
+				takeoverStartTime, lNew, msg.CurrentPoolSize, msg.TargetPoolSize)
 		} else {
+			// 负载过高，转交 BSG (Back-up Supervisor Group)
 			d.sl.Slog.Println("L1: Decision -> CS_l Overloaded. Activating Back-up Supervisor Group (BSG).")
 
 			// 1. 获取目标分片(CS_m)对应的 BSG 成员列表
@@ -364,7 +364,7 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 			// 2. 构造接管指令
 			takeoverMsg := message.MergeMessage(message.CTakeover, []byte("BSG_Activated"))
 
-			// 3. 构建新的“虚拟”路由表 (聚合所有 BSG 节点的 IP)
+			// 3. 构建新的"虚拟"路由表 (聚合所有 BSG 节点的 IP)
 			// 目标：将发往 TargetShard 的交易，均匀分发给 BSG 中的所有节点
 			combinedNodeMap := make(map[uint64]string)
 			virtualNodeIdx := uint64(0)
@@ -380,7 +380,7 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 						// 告诉它们："开始准备接收并处理目标分片的交易"
 						networks.TcpDial(takeoverMsg, ip)
 
-						// B. 将该 IP 加入到“虚拟”路由表中
+						// B. 将该 IP 加入到"虚拟"路由表中
 						// 使用递增的 virtualNodeIdx 作为临时 NodeID
 						combinedNodeMap[virtualNodeIdx] = ip
 						virtualNodeIdx++
@@ -398,6 +398,10 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 			d.sl.Slog.Printf("L1: Traffic redirection complete. %d BSG nodes are now handling Shard %d's transactions.\n",
 				len(combinedNodeMap), msg.TargetShardID)
 
+			// Record BSG takeover event
+			takeoverShardID := bsgShards[0] // Use first BSG shard as primary takeover shard
+			d.recordTakeoverEvent("BSG", takeoverShardID, bsgShards, msg.TargetShardID,
+				takeoverStartTime, lNew, msg.CurrentPoolSize, msg.TargetPoolSize)
 		}
 
 		d.updateShardReputation(msg.TargetShardID, false)
@@ -437,6 +441,38 @@ func (d *Supervisor) handleSupervisionRes(content []byte) {
 	}
 
 }
+
+// recordTakeoverEvent creates and sends a TakeoverEventMsg to measurement modules
+func (d *Supervisor) recordTakeoverEvent(takeoverType string, takeoverShardID uint64, bsgShardIDs []uint64,
+	targetShardID uint64, startTime time.Time, loadFactor float64, reporterPoolSize int, targetPoolSize int) {
+
+	endTime := time.Now()
+	durationMs := endTime.Sub(startTime).Milliseconds()
+
+	takeoverEvent := message.TakeoverEventMsg{
+		Epoch:            d.CurrentEpoch,
+		TakeoverType:     takeoverType,
+		TakeoverShardID:  takeoverShardID,
+		BSGShardIDs:      bsgShardIDs,
+		TargetShardID:    targetShardID,
+		StartTime:        startTime,
+		EndTime:          endTime,
+		DurationMs:       durationMs,
+		LoadFactor:       loadFactor,
+		ReporterPoolSize: reporterPoolSize,
+		TargetPoolSize:   targetPoolSize,
+	}
+
+	// Send to all measurement modules
+	eventBytes, _ := json.Marshal(takeoverEvent)
+	for _, mod := range d.testMeasureMods {
+		mod.HandleExtraMessage(eventBytes)
+	}
+
+	d.sl.Slog.Printf("L1: Recorded %s Takeover Event - Target: %d, Takeover: %d, Duration: %dms\n",
+		takeoverType, targetShardID, takeoverShardID, durationMs)
+}
+
 func (d *Supervisor) updateShardReputation(shardID uint64, success bool) {
 	for nodeID, nodeIP := range d.Ip_nodeTable[shardID] {
 		// 模拟：在内存中找到节点对象并更新
